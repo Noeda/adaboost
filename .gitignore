@@ -1,0 +1,6 @@
+dist
+default.nix
+.cabal-sandbox/
+cabal.sandbox.config
+TAGS
+
