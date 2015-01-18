@@ -3,8 +3,7 @@
 -- Some effort has been made to be generic enough that the following features
 -- should be within reach for the user:
 --
---     * Training data does not need to be loaded in memory. This should allow
---       for very large training sets.
+--     * Training data does not need to be loaded in memory. This should allow very large training sets.
 --
 --     * Weak learners can be trained in parallel.
 --
@@ -16,8 +15,13 @@
 --
 
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RankNTypes #-}
@@ -26,6 +30,9 @@ module Data.AdaBoost
     (
       adaBoost
     , simpleAdaBoost
+    , simpleAdaBoostM
+    , BoostedClassifier()
+    , baseClassifiers
     -- * Classes
     , Class()
     , class1
@@ -37,6 +44,9 @@ module Data.AdaBoost
     , Weights
     , NthClassifier
     , Classifier
+    , ClassifierLike(..)
+    , ClassifierProducer(..)
+    , Combiner
     -- * Combining strategies
     , forkIOIndexedM
     , forIndexedM )
@@ -76,6 +86,33 @@ type Classifier m input = input -> m Class
 newtype Class = Class Bool
                 deriving ( Eq, Enum, Ord, Show, Read, Typeable, Data, Generic )
 
+-- | Class of things that can be turned into plain `Classifier`s.
+--
+-- This type class exists to make it possible to use serializable classifiers
+-- in the algorithm. Haskell functions cannot be serialized right now.
+class ClassifierLike a m input | a -> input where
+    toClassifierFunction :: a -> Classifier m input
+
+instance ClassifierLike (Classifier m input) m input where
+    toClassifierFunction = id
+    {-# INLINE toClassifierFunction #-}
+
+newtype BoostedClassifier (m :: * -> *) classifier weight input = BoostedClassifier
+        { baseClassifiers :: [(weight, classifier)] }
+        deriving ( Eq, Ord, Show, Read, Typeable, Data, Generic )
+
+instance (Functor m, Monad m, RealFloat weight, ClassifierLike classifier m input)
+      => ClassifierLike (BoostedClassifier m classifier weight input)
+                        m input where
+    toClassifierFunction (BoostedClassifier multipliers) inp = do
+        result <- fmap getSum $ execWriterT $ forM_ multipliers $ \(at, ht) -> do
+            result <- lift $ toClassifierFunction ht inp
+            tell $ Sum $ at * if result == class1
+                then -1
+                else 1
+        return $ if result <= 0 then class1 else class2
+    {-# INLINE toClassifierFunction #-}
+
 class1 :: Class
 class1 = Class True
 
@@ -99,22 +136,23 @@ class2 = Class False
 -- , M is the number of classifiers in some iteration and P is the number of
 -- iterations.
 --
-adaBoost :: forall m input weight.
-            (Functor m, Monad m, RealFloat weight, V.Unbox weight)
+adaBoost :: forall m classifier input weight.
+            (Functor m, Monad m, RealFloat weight, V.Unbox weight
+            ,ClassifierLike classifier m input)
          => (NthTrainingItem -> m (input, Class))
          -- ^ Access Nth training data item. It can be undefined for any N that
          -- is equal or larger to given `NumberOfTrainingItems` and for
          -- negative values.
          -> NumberOfTrainingItems
          -- ^ How many training items are there?
-         -> (Weights weight -> m (NumberOfClassifiers, NthClassifier -> m (Classifier m input)))
+         -> (Weights weight -> m (NumberOfClassifiers, NthClassifier -> m classifier))
          -- ^ Given weights, return an action that returns a set of
          --   classifiers, accessed by an indexing function. Often the weights
          --   are not used but you can use them if you want to be informed
          --   which training items are being problematic.
          -> (forall b c. Combiner m b c)
          -- ^ A combiner function.
-         -> m (ClassifierProducer m input) -- ^ Produces classifiers.
+         -> m (ClassifierProducer m classifier weight input) -- ^ Produces classifiers.
 adaBoost training_data training_data_size classifier_trainer combiner =
     iteration initial_weights []
   where
@@ -122,8 +160,8 @@ adaBoost training_data training_data_size classifier_trainer combiner =
     initial_weights = V.replicate training_data_size (1/fromIntegral training_data_size)
 
     iteration :: V.Vector weight
-              -> [(weight, Classifier m input)]
-              -> m (ClassifierProducer m input)
+              -> [(weight, classifier)]
+              -> m (ClassifierProducer m classifier weight input)
     iteration weights multipliers = do
         (num_classifiers, classifier) <- classifier_trainer iweights
 
@@ -137,7 +175,7 @@ adaBoost training_data training_data_size classifier_trainer combiner =
                        then f
                        else s)
                  (\c -> do
-                     (x, y) <- measure_errors weights c
+                     (x, y) <- measure_errors weights (toClassifierFunction c)
                      return (c, x, y))
 
         let new_multipliers = (activate cerror, chosen_classifier):multipliers
@@ -150,13 +188,7 @@ adaBoost training_data training_data_size classifier_trainer combiner =
 
     activate classifier_score = log ((1-classifier_score)/classifier_score)
 
-    final_classifier multipliers vec = do
-        result <- fmap getSum $ execWriterT $ forM_ multipliers $ \(at, ht) -> do
-            result <- lift $ ht vec
-            tell $ Sum $ at * if result == class1
-                then -1
-                else 1
-        return $ if result <= 0 then class1 else class2
+    final_classifier multipliers = BoostedClassifier multipliers
 
     compute_next_weights :: V.Vector weight
                          -> weight
@@ -182,6 +214,33 @@ adaBoost training_data training_data_size classifier_trainer combiner =
                 lift $ modify (IS.insert idx)
 {-# INLINE adaBoost #-}
 
+-- | Similar to `simpleAdaBoost` but allows you to use a monad and a
+-- `ClassifierLike` instead of a simple function.
+simpleAdaBoostM :: forall m f f2 weight classifier input.
+                   (Functor m, Monad m, Foldable f, Foldable f2, RealFloat weight, V.Unbox weight, ClassifierLike classifier m input)
+             => f (input, Class)
+             -- ^ Training data.
+             -> (Weights weight -> m (f2 classifier))
+             -- ^ Classifier generator.
+             -> m (ClassifierProducer m classifier weight input)
+simpleAdaBoostM training_data' generator = do
+    adaBoost (\i -> return $ training_data VG.! i)
+             (VG.length training_data)
+             (\wgts -> monadic_generator wgts)
+             forIndexedM
+  where
+    training_data = VG.fromList $ toList training_data'
+
+    monadic_generator :: Weights weight
+                      -> m (NumberOfClassifiers
+                           , NthClassifier -> m classifier)
+    monadic_generator weights = do
+        folding <- generator weights
+        let classifiers = VG.fromList $ toList folding
+        return ( VG.length classifiers
+               , \i -> return $ classifiers VG.! i )
+{-# INLINE simpleAdaBoostM #-}
+
 -- | Go through a structure that can be indexed, calculate some result for each
 -- value and then combine all the results.
 type Combiner m a b = Int
@@ -191,9 +250,10 @@ type Combiner m a b = Int
                    -> (a -> m b)
                    -> m b
 
-newtype ClassifierProducer m input = ClassifierProducer
+newtype ClassifierProducer m classifier weight input = ClassifierProducer
     { unwrapClassifierProducer ::
-      (input -> m Class, m (ClassifierProducer m input)) }
+      ( BoostedClassifier m classifier weight input
+      , m (ClassifierProducer m classifier weight input)) }
 
 -- | Simple indexer.
 forIndexedM :: Monad m => Combiner m a b
@@ -273,7 +333,7 @@ simpleAdaBoost training_data' generator = runIdentity $ do
 
     listify producer =
         let (classifier, next) = unwrapClassifierProducer producer
-         in (\inp -> runIdentity $ classifier inp):
+         in (\inp -> runIdentity $ toClassifierFunction classifier inp):
             listify (runIdentity next)
 
     monadic_generator weights =
